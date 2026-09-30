@@ -1,0 +1,128 @@
+name: MPF Provider Directory Validation
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"        # AUTOMATIC: check all four contracts every 15 minutes
+  workflow_dispatch:               # MANUAL: Actions -> Run workflow -> pick a contract
+    inputs:
+      contract:
+        description: "Contract to validate"
+        required: true
+        type: choice
+        default: ALL
+        options: [ALL, H1619, H3124, H5826, H9207]
+
+# One run at a time: an update is never validated twice by overlapping runs.
+concurrency:
+  group: mpf-validation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RUN_MODE: ${{ github.event_name == 'schedule' && 'auto' || 'manual' }}
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1. Decide which contracts need work. Unchanged contracts stop here:
+  #    they get no job, no report and no email.
+  # ------------------------------------------------------------------
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      has_work: ${{ steps.detect.outputs.has_work }}
+      statuses: ${{ steps.detect.outputs.statuses }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - id: detect
+        env:
+          CONTRACT_INPUT: ${{ inputs.contract || 'ALL' }}
+        run: python scripts/mpf_monitor.py detect --mode "$RUN_MODE" --contract "$CONTRACT_INPUT"
+
+  # ------------------------------------------------------------------
+  # 2. One independent job per contract that needs validation.
+  #    Runs the SAME validation script for automatic and manual mode.
+  # ------------------------------------------------------------------
+  validate:
+    needs: detect
+    if: needs.detect.outputs.has_work == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    name: validate ${{ matrix.contract }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Validate ${{ matrix.contract }}, build report, send email
+        env:
+          STATUSES_JSON: ${{ needs.detect.outputs.statuses }}
+          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          PREVIOUS: ${{ matrix.previous }}
+          CURRENT: ${{ matrix.current }}
+        run: >
+          python scripts/mpf_monitor.py run
+          --contract "${{ matrix.contract }}" --mode "$RUN_MODE"
+          --previous "$PREVIOUS" --current "$CURRENT"
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ matrix.contract }}
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Upload result marker
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.contract }}
+          path: results/${{ matrix.contract }}.json
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------------
+  # 3. Remember what was processed. Runs once, after every contract job,
+  #    and only advances a contract whose validation actually completed.
+  # ------------------------------------------------------------------
+  update-state:
+    needs: [detect, validate]
+    if: ${{ always() && needs.detect.outputs.has_work == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          path: results
+          merge-multiple: true
+      - run: python scripts/mpf_monitor.py merge-state --results results
+      - name: Commit state
+        run: |
+          git config user.name  "mpf-automation"
+          git config user.email "mpf-automation@users.noreply.github.com"
+          git add state/
+          if git diff --cached --quiet; then echo "State unchanged."; exit 0; fi
+          git commit -m "chore: update MPF processed state [skip ci]"
+          for i in 1 2 3; do git pull --rebase && git push && exit 0; sleep 5; done
+          exit 1
